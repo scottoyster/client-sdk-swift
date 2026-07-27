@@ -231,6 +231,148 @@ extension Transport {
     /// Munge SDP to change `a=inactive` to `a=recvonly` for RTP media m-lines in single PC mode.
     /// WebRTC can generate inactive direction even when transceivers were configured as recvonly.
     /// Only rewrites RTP m-sections — non-RTP sections (e.g. data channel `m=application`) are preserved.
+    /// Mids of audio m-sections in `sdp` whose Opus fmtp advertises
+    /// `sprop-stereo=1` — i.e. the tracks the remote peer is sending in
+    /// stereo.
+    ///
+    /// Port of `extractStereoAndNackAudioFromOffer` in client-sdk-js. Without
+    /// the companion `stereo=1` in our ANSWER (see `mungeOpusStereo`), RFC
+    /// 7587 leaves the receiver defaulting to mono and libwebrtc builds a
+    /// mono Opus decoder, so a stereo publication is downmixed on playback.
+    static func stereoMids(fromOffer sdp: String) -> Set<String> {
+        var result = Set<String>()
+        var isAudioSection = false
+        var mid: String?
+        var opusPayload: String?
+        var sawSpropStereo = false
+
+        func flushSection() {
+            if isAudioSection, sawSpropStereo, let mid { result.insert(mid) }
+            isAudioSection = false
+            mid = nil
+            opusPayload = nil
+            sawSpropStereo = false
+        }
+
+        for line in sdp.components(separatedBy: .newlines) {
+            if line.hasPrefix("m=") {
+                flushSection()
+                isAudioSection = line.hasPrefix("m=audio")
+                continue
+            }
+            guard isAudioSection else { continue }
+
+            if line.hasPrefix("a=mid:") {
+                mid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if let payload = Self.opusPayload(fromRtpmapLine: line) {
+                opusPayload = payload
+            } else if let opusPayload,
+                      let config = Self.fmtpConfig(fromLine: line, payload: opusPayload),
+                      Self.fmtpParameters(config).contains("sprop-stereo=1")
+            {
+                sawSpropStereo = true
+            }
+        }
+        flushSection()
+        return result
+    }
+
+    /// Adds `stereo=1` to the Opus fmtp of every audio m-section in `sdp`
+    /// whose mid is in `stereoMids`.
+    ///
+    /// Port of `ensureAudioNackAndStereo` in client-sdk-js (stereo half only).
+    /// This must be applied to the ANSWER: `stereo` is the RECEIVER's declared
+    /// preference (RFC 7587 §7.1), and it is what decides whether libwebrtc
+    /// instantiates a stereo or a mono Opus decoder for the stream.
+    static func mungeOpusStereo(_ sdp: String, stereoMids: Set<String>) -> String {
+        guard !stereoMids.isEmpty else { return sdp }
+
+        let usesCRLF = sdp.contains("\r\n")
+        let eol = usesCRLF ? "\r\n" : "\n"
+        var lines = sdp.components(separatedBy: usesCRLF ? "\r\n" : "\n")
+
+        // An m-section's `a=mid:` can appear after its `a=fmtp:`, so resolve
+        // each section's mid and Opus payload first, then rewrite.
+        var sectionRanges: [(range: Range<Int>, mid: String?, opusPayload: String?)] = []
+        var sectionStart: Int?
+        var mid: String?
+        var opusPayload: String?
+        var isAudioSection = false
+
+        func closeSection(endingAt end: Int) {
+            if let start = sectionStart, isAudioSection {
+                sectionRanges.append((start ..< end, mid, opusPayload))
+            }
+            sectionStart = nil
+            mid = nil
+            opusPayload = nil
+            isAudioSection = false
+        }
+
+        for (index, line) in lines.enumerated() {
+            if line.hasPrefix("m=") {
+                closeSection(endingAt: index)
+                sectionStart = index
+                isAudioSection = line.hasPrefix("m=audio")
+                continue
+            }
+            guard isAudioSection else { continue }
+            if line.hasPrefix("a=mid:") {
+                mid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if let payload = Self.opusPayload(fromRtpmapLine: line) {
+                opusPayload = payload
+            }
+        }
+        closeSection(endingAt: lines.count)
+
+        for section in sectionRanges {
+            guard let mid = section.mid, stereoMids.contains(mid),
+                  let payload = section.opusPayload else { continue }
+
+            for index in section.range {
+                guard let config = Self.fmtpConfig(fromLine: lines[index], payload: payload) else {
+                    continue
+                }
+                // Exact-token check. A substring test for "stereo=1" would
+                // also match "sprop-stereo=1" and silently skip the section —
+                // client-sdk-js has that looser check.
+                guard !Self.fmtpParameters(config).contains("stereo=1") else { break }
+                lines[index] = "a=fmtp:\(payload) " + config + ";stereo=1"
+                break
+            }
+        }
+
+        var result = lines.joined(separator: eol)
+        if sdp.hasSuffix(eol), !result.hasSuffix(eol) { result += eol }
+        return result
+    }
+
+    /// Payload type from an `a=rtpmap:<pt> opus/…` line, else nil.
+    private static func opusPayload(fromRtpmapLine line: String) -> String? {
+        guard line.hasPrefix("a=rtpmap:") else { return nil }
+        let value = line.dropFirst("a=rtpmap:".count)
+        let parts = value.split(separator: " ", maxSplits: 1)
+        guard parts.count == 2,
+              parts[1].lowercased().hasPrefix("opus/") else { return nil }
+        return String(parts[0])
+    }
+
+    /// Config portion of `a=fmtp:<payload> <config>`, else nil.
+    private static func fmtpConfig(fromLine line: String, payload: String) -> String? {
+        let prefix = "a=fmtp:\(payload) "
+        guard line.hasPrefix(prefix) else { return nil }
+        return String(line.dropFirst(prefix.count))
+    }
+
+    /// fmtp config split into its `key=value` parameters, whitespace trimmed.
+    private static func fmtpParameters(_ config: String) -> Set<String> {
+        Set(config.split(separator: ";").map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        })
+    }
+
     static func mungeInactiveToRecvOnlyForMedia(_ sdp: String) -> String {
         let usesCRLF = sdp.contains("\r\n")
         let eol = usesCRLF ? "\r\n" : "\n"

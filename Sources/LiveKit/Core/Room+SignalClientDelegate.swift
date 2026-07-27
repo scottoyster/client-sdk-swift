@@ -364,7 +364,23 @@ extension Room: SignalClientDelegate {
 
         do {
             try await subscriber.set(remoteDescription: offer)
-            let answer = try await subscriber.createAnswer()
+            var answer = try await subscriber.createAnswer()
+
+            // Declare stereo receive for any track the SFU is publishing in
+            // stereo. `stereo` is the RECEIVER's preference (RFC 7587 §7.1):
+            // absent it, libwebrtc creates a MONO Opus decoder and downmixes,
+            // so a 2-channel publication plays back mono. client-sdk-js does
+            // this via ensureAudioNackAndStereo(); without it the Swift client
+            // is mono-only for stereo sources.
+            let stereoMids = Transport.stereoMids(fromOffer: offer.sdp)
+            if !stereoMids.isEmpty {
+                let munged = Transport.mungeOpusStereo(answer.sdp, stereoMids: stereoMids)
+                if munged != answer.sdp {
+                    log("Negotiating Opus stereo for mids: \(stereoMids.sorted())")
+                    answer = RTC.createSessionDescription(type: answer.type, sdp: munged)
+                }
+            }
+
             try await subscriber.set(localDescription: answer)
             try await signalClient.send(answer: answer, offerId: offerId)
             connectSpan?.record("answer_sent")
