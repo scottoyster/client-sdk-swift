@@ -373,6 +373,19 @@ extension Room: SignalClientDelegate {
             // this via ensureAudioNackAndStereo(); without it the Swift client
             // is mono-only for stereo sources.
             let stereoMids = Transport.stereoMids(fromOffer: offer.sdp)
+            #if DEBUG
+            // Deliberately `print`, not `log`: this has to be visible without
+            // the app opting into SDK debug logging, because "mono" has three
+            // possible causes and only this tells them apart — the SFU never
+            // advertised sprop-stereo, we failed to add stereo=1, or both were
+            // fine and the downmix is happening further down the render path.
+            for line in offer.sdp.components(separatedBy: .newlines)
+                where line.hasPrefix("a=fmtp:") && line.contains("stereo")
+            {
+                print("[StereoSDP] offer  \(line)")
+            }
+            print("[StereoSDP] stereo mids in offer: \(stereoMids.sorted())")
+            #endif
             if !stereoMids.isEmpty {
                 let munged = Transport.mungeOpusStereo(answer.sdp, stereoMids: stereoMids)
                 if munged != answer.sdp {
@@ -380,6 +393,13 @@ extension Room: SignalClientDelegate {
                     answer = RTC.createSessionDescription(type: answer.type, sdp: munged)
                 }
             }
+            #if DEBUG
+            for line in answer.sdp.components(separatedBy: .newlines)
+                where line.hasPrefix("a=fmtp:") && line.contains("stereo")
+            {
+                print("[StereoSDP] answer \(line)")
+            }
+            #endif
 
             try await subscriber.set(localDescription: answer)
             try await signalClient.send(answer: answer, offerId: offerId)
